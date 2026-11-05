@@ -1,0 +1,18 @@
+[package]
+name = "simu_ecs_poc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zenoh = "0.10.1-rc"
+tokio = { version = "1.53.2", features = ["full"] }
+sysinfo = "0.30"
+shared = { path = "./shared" }
+
+wasmtime = "50.0.1"
+wasmtime-wasi = "50.0.1"
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+uuid = { version = "1.23.1", features = ["v4", "serde"] }

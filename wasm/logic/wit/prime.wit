@@ -1,0 +1,9 @@
+package demo:primes;
+
+interface calcul {
+    how-many-prime-in-range: func(start: u64, end: u64) -> u64;
+}
+
+world primes {
+    export calcul;
+}
