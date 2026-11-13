@@ -35,12 +35,12 @@ struct Topic {
 }
 
 pub struct ServOpt {
-    key: PathBuf,
-    cert: PathBuf,
-    stateless_retry: bool,
-    listen: SocketAddr,
-    block: Option<SocketAddr>,
-    connection_limit: Option<usize>,
+    pub key: PathBuf,
+    pub cert: PathBuf,
+    pub stateless_retry: bool,
+    pub listen: SocketAddr,
+    pub block: Option<SocketAddr>,
+    pub connection_limit: Option<usize>,
 }
 
 pub struct PSServer {
@@ -50,14 +50,14 @@ pub struct PSServer {
 
 
 impl PSServer {
-    fn new(option: ServOpt) -> Self {
+    pub fn new() -> Self {
         PSServer {
             topics: Vec::new(),
             clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
-    async fn start(&self, options: ServOpt) {
+    pub async fn start(&self, options: ServOpt) {
         let (cert, key) = Self::get_key_and_cert(&options.cert, &options.key).unwrap();
 
         let mut server_crypto = rustls::ServerConfig::builder()
@@ -142,8 +142,11 @@ impl PSServer {
             None => default_dir()?.join("key.der"),
         };
 
+        if cert_path.exists() && key_path.exists() {
+            return Ok((cert_path, key_path));   // déjà là, rien à faire
+        }
         if cert_path.exists() || key_path.exists() {
-            anyhow::bail!("Le certificat ou la clé existe déjà.");
+            anyhow::bail!("un seul des deux fichiers existe : état incohérent, supprime-les");
         }
 
         let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()])
@@ -166,6 +169,7 @@ impl PSServer {
     async fn handle_connection(incoming: Incoming, clients: Clients) -> Result<()> {
         let connection = incoming.await?;
         let id = connection.stable_id();
+        info!("accepted connection from {} with id {}", connection.remote_address(), id);
 
         let (send, mut recv) = match connection.accept_bi().await {
             Ok(s) => s,
@@ -217,7 +221,7 @@ impl PSServer {
     }
 
     fn disconnect () {
-
+        
     }
 }
 

@@ -3,3 +3,4 @@ bin/
 obj/
 quinn
 serv-test
+.idea
