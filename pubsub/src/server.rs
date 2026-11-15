@@ -13,6 +13,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Connection, Incoming, RecvStream};
 use tracing::{error, info, info_span, Instrument};
 use crate::common;
+use crate::common::MessageHandler;
 
 type Clients = Arc<tokio::sync::Mutex<HashMap<usize, Arc<Client>>>>;
 
@@ -29,7 +30,7 @@ impl Client {
 
 struct Topic {
     name: String,
-    subscribers: Vec<Client>,
+    subscribers: Vec<Arc<Client>>,
     inbox: Vec<String>,
     outbox: Vec<String>,
 }
@@ -43,8 +44,11 @@ pub struct ServOpt {
     pub connection_limit: Option<usize>,
 }
 
+type Topics = Arc<tokio::sync::Mutex<HashMap<String, Topic>>>;
+
+#[derive(Clone)]
 pub struct PSServer {
-    topics: Vec<Topic>,
+    topics: Topics, //hashmap of topics with name as key and topic as value
     clients: Clients,
 }
 
@@ -52,7 +56,7 @@ pub struct PSServer {
 impl PSServer {
     pub fn new() -> Self {
         PSServer {
-            topics: Vec::new(),
+            topics: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             clients: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -88,7 +92,7 @@ impl PSServer {
                 conn.retry().unwrap();
             } else {
                 info!("accepting connection");
-                let fut = Self::handle_connection(conn, self.clients.clone());
+                let fut = Self::handle_connection(conn, self.clone());
                 tokio::spawn(async move {
                     if let Err(e) = fut.await {
                         error!("connection failed: {reason}", reason = e.to_string())
@@ -165,8 +169,7 @@ impl PSServer {
 
         Ok((cert_path, key_path))
     }
-
-    async fn handle_connection(incoming: Incoming, clients: Clients) -> Result<()> {
+    async fn handle_connection(incoming: Incoming, server: PSServer) -> Result<()> {
         let connection = incoming.await?;
         let id = connection.stable_id();
         info!("accepted connection from {} with id {}", connection.remote_address(), id);
@@ -181,51 +184,113 @@ impl PSServer {
         };
 
         let client = Arc::new(Client::new(connection, send));
-        clients.lock().await.insert(id, Arc::clone(&client));
+        server.clients.lock().await.insert(id, Arc::clone(&client));
 
-        let result = Self::read_loop(&client, &mut recv).await;
+        let handler = ServerMessageHandler {
+            server: server.clone(),
+            client: Arc::clone(&client),
+        };
+
+        let result = Self::read_loop(&handler, &mut recv).await;
 
         // nettoyage dans tous les cas
-        clients.lock().await.remove(&id);
+        // nettoyage : table des clients + abonnements
+        server.clients.lock().await.remove(&id);
+        for t in server.topics.lock().await.values_mut() {
+            t.subscribers.retain(|c| c.connection.stable_id() != id);
+        }
 
         result
     }
-
-    async fn read_loop(client: &Client, recv: &mut RecvStream) -> Result<()> {
-        let id = client.connection.stable_id();
-        let mut buf = [0u8; 1024];
+    async fn read_loop(handler: &ServerMessageHandler, recv: &mut RecvStream) -> Result<()> {
+        let id = handler.client.connection.stable_id();
         loop {
-            let n = match recv.read(&mut buf).await? {
-                None => {
-                    info!("client {id} closed its stream");
-                    return Ok(());
-                }
-                Some(n) => n,
+            let Some(data) = common::read_message(recv).await? else {
+                info!("client {id} closed its stream");
+                return Ok(());
             };
-            info!("received {n} bytes from client {id}");
-
-            //TODO: traiter les msg pour les mettre dans l'inbox du topic correspondant
+            let msg = common::PubSubMessage::deserialize(&data).map_err(|e| anyhow!(e))?;
+            msg.handle_message(handler).await.map_err(|e| anyhow!(e))?;
         }
-    }
-
-    fn add_subscriber() {
-
-    }
-
-    fn remove_subscriber() {
-
-    }
-
-    fn publish () {
-
-    }
-
-    fn disconnect () {
-        
     }
 }
 
+struct ServerMessageHandler{
+    server: PSServer,
+    client: Arc<Client>
+}
+
+impl MessageHandler for ServerMessageHandler {
+    async fn on_create_topic(&self, topic: String) -> std::result::Result<(), String> {
+        let mut topics = self.server.topics.lock().await;
+        if topics.contains_key(&topic) {
+            return Err(format!("Topic {} already exists", topic));
+        }
+        topics.insert(topic.clone(), Topic {
+            name: topic,
+            subscribers: Vec::new(),
+            inbox: Vec::new(),
+            outbox: Vec::new(),
+        });
+        Ok(())
+    }
+
+    async fn on_delete_topic(&self, topic: String) -> std::result::Result<(), String> {
+        let mut topics = self.server.topics.lock().await;
+        if !topics.contains_key(&topic) {
+            return Err(format!("Topic {} does not exist", topic));
+        }
+        topics.remove(&topic);
+        Ok(())
+    }
+
+    async fn on_subscribe(&self, topic: String) -> std::result::Result<(), String> {
+        let mut topics = self.server.topics.lock().await;
+        if let Some(t) = topics.get_mut(&topic) {
+            t.subscribers.push(Arc::clone(&self.client));
+            Ok(())
+        } else {
+            Err(format!("Topic {} does not exist", topic))
+        }
+    }
+
+    async fn on_unsubscribe(&self, topic: String) -> std::result::Result<(), String> {
+        let mut topics = self.server.topics.lock().await;
+        if let Some(t) = topics.get_mut(&topic) {
+            t.subscribers.retain(|c| c.connection.stable_id() != self.client.connection.stable_id());
+            Ok(())
+        } else {
+            Err(format!("Topic {} does not exist", topic))
+        }
+    }
+
+    ///put the message in the inbox of the topic, if the topic exists, otherwise return an error
+    async fn on_publish(&self, topic: String, message: Vec<u8>) -> std::result::Result<(), String> {
+        let mut topics = self.server.topics.lock().await;
+        if let Some(t) = topics.get_mut(&topic) {
+            t.inbox.push(String::from_utf8(message).map_err(|e| e.to_string())?);
+            Ok(())
+        } else {
+            Err(format!("Topic {} does not exist", topic))
+        }
+    }
+
+    async fn on_disconnect(&self) -> std::result::Result<(), String> {
+        let id = self.client.connection.stable_id();
+        let mut clients = self.server.clients.lock().await;
+        clients.remove(&id);
+        let mut topics = self.server.topics.lock().await;
+        for t in topics.values_mut() {
+            t.subscribers.retain(|c| c.connection.stable_id() != id);
+        }
+        Ok(())
+    }
+}
 
 //TODO: Ce qui est un job :
-// - le traitement des inbox des topics
+// - le traitement des inbox des topics - OK
+// - inbox vers outbox des topics
 // - la publication des outbox des topics
+
+
+//just un load balancer ou full pub sub ?

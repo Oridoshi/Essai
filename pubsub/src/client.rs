@@ -14,6 +14,7 @@ use quinn::{Connection, Endpoint, Incoming, RecvStream};
 use tracing::{error, info, info_span, Instrument};
 use url::Url;
 use crate::common;
+use crate::common::MessageHandler;
 
 struct Server {
     connection: Connection,
@@ -35,6 +36,7 @@ pub struct CliOpt {
     pub bind: SocketAddr,
 }
 
+#[derive(Clone)]
 pub struct PSClient {
     server: Option<Arc<Server>>,
 }
@@ -110,8 +112,13 @@ impl PSClient {
         });
         self.server = Some(Arc::clone(&server));
 
+        let handler = ClientMessageHandler {
+            client: self.clone(),
+            server: Arc::clone(&server),
+        };
+
         tokio::spawn(async move {
-            if let Err(e) = Self::read_loop(&server, &mut recv).await {
+            if let Err(e) = Self::read_loop(&handler, &mut recv).await {
                 error!("read loop failed: {e}");
             }
         });
@@ -119,27 +126,67 @@ impl PSClient {
         Ok(())
     }
 
-    async fn read_loop(server: &Server, recv: &mut RecvStream) -> Result<()> {
-        let id = server.connection.stable_id();
-        let mut buf = [0u8; 1024];
+    async fn read_loop(handler: &ClientMessageHandler, recv: &mut RecvStream) -> Result<()> {
+        let id = handler.server.connection.stable_id();
         loop {
-            let n = match recv.read(&mut buf).await? {
-                None => {
-                    info!("server {id} closed its stream");
-                    return Ok(());
-                }
-                Some(n) => n,
+            let Some(data) = common::read_message(recv).await? else {
+                info!("client {id} closed its stream");
+                return Ok(());
             };
-            info!("received {n} bytes from server {id}");
+            let msg = common::PubSubMessage::deserialize(&data).map_err(|e| anyhow!(e))?;
+            msg.handle_message(handler).await.map_err(|e| anyhow!(e))?;
+        }
+    }
 
-            //TODO: traiter les msg pour les mettre une inbox (par rapport a un topic ?)
+    pub async fn send_message(&self, message: common::PubSubMessage) -> Result<()> {
+        if let Some(server) = &self.server {
+            let data = message.serialize();
+            let mut send = server.send.lock().await;
+            common::send_message(&mut *send, &data).await?;
+            Ok(())
+        } else {
+            Err(anyhow!("Not connected to a server"))
         }
     }
 }
 
-/*
-fn disconnect() -> Result<(), Box<dyn Error + Send + Sync>>;
-fn subscribe(topic: &str) -> Result<(), Box<dyn Error + Send + Sync>>;
-fn unsubscribe(topic: &str) -> Result<(), Box<dyn Error + Send + Sync>>;
-fn publish(topic: &str, data: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>>;
-*/
+
+struct ClientMessageHandler {
+    client: PSClient,
+    server: Arc<Server>,
+}
+
+impl MessageHandler for ClientMessageHandler {
+    ///print the message received from the server
+    async fn on_create_topic(&self, topic: String) -> std::result::Result<(), String> {
+        info!("Topic created: {}", topic);
+        Ok(())
+    }
+
+    async fn on_delete_topic(&self, topic: String) -> std::result::Result<(), String> {
+        info!("Topic deleted: {}", topic);
+        Ok(())
+    }
+
+    async fn on_subscribe(&self, topic: String) -> std::result::Result<(), String> {
+        info!("Subscribed to topic: {}", topic);
+        Ok(())
+    }
+
+    async fn on_unsubscribe(&self, topic: String) -> std::result::Result<(), String> {
+        info!("Unsubscribed from topic: {}", topic);
+        Ok(())
+    }
+
+    async fn on_publish(&self, topic: String, message: Vec<u8>) -> std::result::Result<(), String> {
+        let message_str = String::from_utf8(message).map_err(|e| e.to_string())?;
+        info!("Received message on topic {}: {}", topic, message_str);
+        //TODO: faire en sorte que ce soit l'utilisateur dans un prog externe qui code ce que ça doit faire car chaque cli a une logic diff.
+        Ok(())
+    }
+
+    async fn on_disconnect(&self) -> std::result::Result<(), String> {
+        info!("Disconnected from server");
+        Ok(())
+    }
+}
