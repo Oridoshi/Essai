@@ -5,7 +5,7 @@ use std::{
     str,
     sync::Arc,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use anyhow::{Context, Result, anyhow, bail};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::pki_types::pem::PemObject;
@@ -31,8 +31,8 @@ impl Client {
 struct Topic {
     name: String,
     subscribers: Vec<Arc<Client>>,
-    inbox: Vec<String>,
-    outbox: Vec<String>,
+    inbox: VecDeque<Vec<u8>>,
+    outbox: VecDeque<Vec<u8>>,
 }
 
 pub struct ServOpt {
@@ -213,6 +213,61 @@ impl PSServer {
             msg.handle_message(handler).await.map_err(|e| anyhow!(e))?;
         }
     }
+
+    ///actuellement dumb methode, qui ne fait que vider l'inbox dans l'outbox
+    async fn process_inbox(&self, topic: String) -> std::result::Result<(), String> {
+        let mut topics = self.topics.lock().await;
+        if let Some(t) = topics.get_mut(&topic) {
+            while let Some(message) = t.inbox.pop_front() {
+                t.outbox.push_back(message);
+            }
+            Ok(())
+        } else {
+            Err(format!("Topic {} does not exist", topic))
+        }
+    }
+
+    ///check if the inbox of the topic is empty, if the topic exists, otherwise return an error
+    async fn is_inbox_empty(&self, topic: String) -> std::result::Result<bool, String> {
+        let topics = self.topics.lock().await;
+        if let Some(t) = topics.get(&topic) {
+            Ok(!t.inbox.is_empty())
+        } else {
+            Err(format!("Topic {} does not exist", topic))
+        }
+    }
+
+    ///check if the outbox of the topic is empty, if the topic exists, otherwise return an error
+    async fn is_outbox_empty(&self, topic: String) -> std::result::Result<bool, String> {
+        let topics = self.topics.lock().await;
+        if let Some(t) = topics.get(&topic) {
+            Ok(!t.outbox.is_empty())
+        } else {
+            Err(format!("Topic {} does not exist", topic))
+        }
+    }
+
+
+    async fn check_if_topic_exists(&self, topic: String) -> std::result::Result<bool, String> {
+        let topics = self.topics.lock().await;
+        Ok(topics.contains_key(&topic))
+    }
+
+    async fn process_outbox(&self, topic: String) -> std::result::Result<(), String> {
+        let mut topics = self.topics.lock().await;
+        if let Some(t) = topics.get_mut(&topic) {
+            while let Some(message) = t.outbox.pop_front() {
+                for subscriber in &t.subscribers {
+                    let data = common::PubSubMessage::Publish(topic.clone(), message.clone()).serialize();
+                    let mut send = subscriber.send.lock().await;
+                    common::send_message(&mut *send, &data).await.map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(())
+        } else {
+            Err(format!("Topic {} does not exist", topic))
+        }
+    }
 }
 
 struct ServerMessageHandler{
@@ -229,8 +284,8 @@ impl MessageHandler for ServerMessageHandler {
         topics.insert(topic.clone(), Topic {
             name: topic,
             subscribers: Vec::new(),
-            inbox: Vec::new(),
-            outbox: Vec::new(),
+            inbox: VecDeque::new(),
+            outbox: VecDeque::new(),
         });
         Ok(())
     }
@@ -268,7 +323,7 @@ impl MessageHandler for ServerMessageHandler {
     async fn on_publish(&self, topic: String, message: Vec<u8>) -> std::result::Result<(), String> {
         let mut topics = self.server.topics.lock().await;
         if let Some(t) = topics.get_mut(&topic) {
-            t.inbox.push(String::from_utf8(message).map_err(|e| e.to_string())?);
+            t.inbox.push_back(message.clone());
             Ok(())
         } else {
             Err(format!("Topic {} does not exist", topic))
@@ -289,8 +344,7 @@ impl MessageHandler for ServerMessageHandler {
 
 //TODO: Ce qui est un job :
 // - le traitement des inbox des topics - OK
-// - inbox vers outbox des topics
-// - la publication des outbox des topics
+// - inbox vers outbox des topics (dumb metode pour l'instant) - OK
+// - la publication des outbox des topics - OK
 
-
-//just un load balancer ou full pub sub ?
+//TODO: TOUT PASSER SOUS JOBSYS
