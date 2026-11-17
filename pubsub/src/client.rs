@@ -17,7 +17,7 @@ use crate::common;
 use crate::common::MessageHandler;
 
 #[derive(Clone)]
-struct Topic {
+pub struct Topic {
     name: String,
     inbox: VecDeque<Vec<u8>>,
 }
@@ -47,7 +47,7 @@ type Topics = Arc<tokio::sync::Mutex<HashMap<String, Topic>>>;
 #[derive(Clone)]
 pub struct PSClient {
     server: Option<Arc<Server>>,
-    topics: Topics,
+    pub topics: Topics,
 }
 
 
