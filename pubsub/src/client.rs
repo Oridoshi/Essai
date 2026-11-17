@@ -5,7 +5,7 @@ use std::{
     str,
     sync::Arc,
 };
-
+use std::collections::{HashMap, VecDeque};
 use std::net::ToSocketAddrs;
 use anyhow::{Result, anyhow, bail};
 use rustls::pki_types::{CertificateDer};
@@ -15,6 +15,12 @@ use tracing::{error, info, info_span, Instrument};
 use url::Url;
 use crate::common;
 use crate::common::MessageHandler;
+
+#[derive(Clone)]
+struct Topic {
+    name: String,
+    inbox: VecDeque<Vec<u8>>,
+}
 
 struct Server {
     connection: Connection,
@@ -36,9 +42,12 @@ pub struct CliOpt {
     pub bind: SocketAddr,
 }
 
+type Topics = Arc<tokio::sync::Mutex<HashMap<String, Topic>>>;
+
 #[derive(Clone)]
 pub struct PSClient {
     server: Option<Arc<Server>>,
+    topics: Topics,
 }
 
 
@@ -46,6 +55,7 @@ impl PSClient {
     pub fn new() -> Self {
         PSClient {
             server: None,
+            topics: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -179,11 +189,16 @@ impl MessageHandler for ClientMessageHandler {
     }
 
     async fn on_publish(&self, topic: String, message: Vec<u8>) -> std::result::Result<(), String> {
-        let message_str = String::from_utf8(message).map_err(|e| e.to_string())?;
-        info!("Received message on topic {}: {}", topic, message_str);
-        //TODO: faire en sorte que ce soit l'utilisateur dans un prog externe qui code ce que ça doit faire car chaque cli a une logic diff.
+        let data = String::from_utf8(message.clone()).map_err(|e| format!("Invalid UTF-8 message: {}", e))?;
+        info!("Received message on topic {}: {}", topic, data);
+
+        self.client.topics.lock().await.entry(topic.clone()).or_insert(Topic {
+            name: topic.clone(),
+            inbox: VecDeque::new(),
+        }).inbox.push_back(message.clone());
+
         Ok(())
-    }
+    }//TODO: a tester dans prog test, pour voir si le message est bien reçu et stocké dans l'inbox du topic
 
     async fn on_disconnect(&self) -> std::result::Result<(), String> {
         info!("Disconnected from server");
