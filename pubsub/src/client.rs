@@ -93,7 +93,7 @@ impl PSClient {
         let mut client_crypto = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        client_crypto.alpn_protocols = common::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+        client_crypto.alpn_protocols = common::ALPN_PUBSUB.iter().map(|&x| x.into()).collect();
 
         let client_config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
         let mut endpoint = quinn::Endpoint::client(option.bind)?;
@@ -127,6 +127,13 @@ impl PSClient {
             server: Arc::clone(&server),
         };
 
+        let dgram_handler = handler.clone();
+        let dgram_conn = conn.clone();
+
+        let dgram_task = tokio::spawn(async move {
+            let _ = Self::read_loop_dgram(dgram_conn, &dgram_handler).await;
+        });
+
         tokio::spawn(async move {
             if let Err(e) = Self::read_loop(&handler, &mut recv).await {
                 error!("read loop failed: {e}");
@@ -148,6 +155,29 @@ impl PSClient {
         }
     }
 
+    async fn read_loop_dgram(conn: Connection, handler: &ClientMessageHandler) -> Result<()> {
+        loop {
+            match conn.read_datagram().await {
+                Ok(bytes) => {
+                    match common::PubSubMessage::deserialize(&bytes) {
+                        // seul Publish a du sens en datagramme
+                        Ok(msg @ common::PubSubMessage::Publish(..)) => {
+                            if let Err(e) = msg.handle_message(handler).await {
+                                error!("datagramme refusé : {e}");
+                            }
+                        }
+                        Ok(_) => error!("commande interdite en datagramme"),
+                        Err(e) => error!("datagramme invalide : {e}"),
+                    }
+                }
+                Err(_) => {
+                    info!("client {} closed its datagram stream", conn.stable_id());
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     pub async fn send_message(&self, message: common::PubSubMessage) -> Result<()> {
         if let Some(server) = &self.server {
             let data = message.serialize();
@@ -160,7 +190,7 @@ impl PSClient {
     }
 }
 
-
+#[derive(Clone)]
 struct ClientMessageHandler {
     client: PSClient,
     server: Arc<Server>,
@@ -168,13 +198,8 @@ struct ClientMessageHandler {
 
 impl MessageHandler for ClientMessageHandler {
     ///print the message received from the server
-    async fn on_create_topic(&self, topic: String) -> std::result::Result<(), String> {
-        info!("Topic created: {}", topic);
-        Ok(())
-    }
-
-    async fn on_delete_topic(&self, topic: String) -> std::result::Result<(), String> {
-        info!("Topic deleted: {}", topic);
+    async fn on_create_topic(&self, topic: String, reliable: bool) -> std::result::Result<(), String> {
+        info!("Topic created: {} (reliable: {})", topic, reliable);
         Ok(())
     }
 
@@ -199,9 +224,4 @@ impl MessageHandler for ClientMessageHandler {
 
         Ok(())
     }//TODO: a tester dans prog test, pour voir si le message est bien reçu et stocké dans l'inbox du topic
-
-    async fn on_disconnect(&self) -> std::result::Result<(), String> {
-        info!("Disconnected from server");
-        Ok(())
-    }
 }
